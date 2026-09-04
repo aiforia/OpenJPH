@@ -71,8 +71,11 @@ namespace ojph {
 
       void restart();
 
-      void pre_alloc();
-      void finalize_alloc();
+      // Allocates the tile rows in [tr_beg, tr_end) together with all the
+      // frame-level structures.  Passing (0, num_tiles.h) allocates the
+      // whole frame, which is what both the encoder and the decoder do.
+      void pre_alloc(ui32 tr_beg, ui32 tr_end);
+      void finalize_alloc(ui32 tr_beg, ui32 tr_end);
 
       ojph::param_siz access_siz()            // returns externally wrapped siz
       { return ojph::param_siz(&siz); }
@@ -126,6 +129,19 @@ namespace ojph {
       { return skipped_res_for_read; }
 
     private:
+      // Derives num_tiles from siz; idempotent, and safe to call more than
+      // once.
+      void calculate_num_tiles();
+      // The frame-level halves of pre_alloc()/finalize_alloc().  These serve
+      // the structures that live for the whole frame and therefore must not
+      // be re-created when only a range of tile rows is (re-)allocated.
+      // finalize_alloc_tlm() is separate from finalize_alloc_frame() only
+      // because it needs the tile-part count, which the tile loop produces.
+      void pre_alloc_frame(ui32 num_tileparts);
+      void finalize_alloc_frame();
+      void finalize_alloc_tlm(ui32 num_tileparts);
+
+    private:
       ui32 precinct_scratch_needed_bytes;
       ui8* precinct_scratch;
 
@@ -162,7 +178,13 @@ namespace ojph {
       param_atk atk;         // wavelet structure and coefficients
 
     private:
+      // "allocator" serves the tile-level working set -- everything reached
+      // through tile::pre_alloc()/tile::finalize_alloc(), which is the bulk
+      // of the memory.  "frame_allocator" serves the structures that must
+      // outlive any single tile row, so that the tile-level allocator can
+      // later be recycled on a per-tile-row basis.
       mem_fixed_allocator *allocator;
+      mem_fixed_allocator *frame_allocator;
       mem_elastic_allocator *elastic_alloc;
       outfile_base *outfile;
       infile_base *infile;

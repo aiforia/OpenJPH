@@ -54,9 +54,11 @@ namespace ojph {
 
     //////////////////////////////////////////////////////////////////////////
     codestream::codestream()
-    : precinct_scratch(NULL), allocator(NULL), elastic_alloc(NULL)
+    : precinct_scratch(NULL), allocator(NULL), frame_allocator(NULL),
+      elastic_alloc(NULL)
     {
       allocator = new mem_fixed_allocator;
+      frame_allocator = new mem_fixed_allocator;
       elastic_alloc = new mem_elastic_allocator(1048576); // 1 megabyte
 
       init_colour_transform_functions();
@@ -70,6 +72,8 @@ namespace ojph {
     {
       if (allocator)
         delete allocator;
+      if (frame_allocator)
+        delete frame_allocator;
       if (elastic_alloc)
         delete elastic_alloc;
     }
@@ -106,11 +110,12 @@ namespace ojph {
       atk.restart();
 
       allocator->restart();
+      frame_allocator->restart();
       elastic_alloc->restart();
     }
 
     //////////////////////////////////////////////////////////////////////////
-    void codestream::pre_alloc()
+    void codestream::calculate_num_tiles()
     {
       ojph::param_siz sz = access_siz();
       num_tiles.w = sz.get_image_extent().x - sz.get_tile_offset().x;
@@ -121,15 +126,19 @@ namespace ojph {
         OJPH_ERROR(0x00030011, "the number of tiles cannot exceed 65535");
       if (num_tiles.area() == 0)
         OJPH_ERROR(0x00030012, "the number of tiles cannot be 0");
+    }
 
-      //allocate tiles
-      allocator->pre_alloc_obj<tile>((size_t)num_tiles.area());
+    //////////////////////////////////////////////////////////////////////////
+    void codestream::pre_alloc(ui32 tr_beg, ui32 tr_end)
+    {
+      calculate_num_tiles();
 
+      ojph::param_siz sz = access_siz();
       ui32 num_tileparts = 0;
       point index;
       rect tile_rect, recon_tile_rect;
       ui32 ds = 1 << skipped_res_for_recon;
-      for (index.y = 0; index.y < num_tiles.h; ++index.y)
+      for (index.y = tr_beg; index.y < tr_end; ++index.y)
       {
         ui32 y0 = sz.get_tile_offset().y
                 + index.y * sz.get_tile_size().h;
@@ -167,19 +176,33 @@ namespace ojph {
         }
       }
 
+      pre_alloc_frame(num_tileparts);
+    }
+
+    //////////////////////////////////////////////////////////////////////////
+    void codestream::pre_alloc_frame(ui32 num_tileparts)
+    {
+      ojph::param_siz sz = access_siz();
+
+      //allocate tiles
+      // The array spans the whole frame, so that tiles[idx] keeps being
+      // indexed by the tile index carried in the codestream.
+      frame_allocator->pre_alloc_obj<tile>((size_t)num_tiles.area());
+
       //allocate lines
       //These lines are used by codestream to exchange data with external
       // world
       ui32 num_comps = sz.get_num_components();
-      allocator->pre_alloc_obj<line_buf>(num_comps);
-      allocator->pre_alloc_obj<size>(num_comps); //for *comp_size
-      allocator->pre_alloc_obj<size>(num_comps); //for *recon_comp_size
+      frame_allocator->pre_alloc_obj<line_buf>(num_comps);
+      frame_allocator->pre_alloc_obj<size>(num_comps); //for *comp_size
+      frame_allocator->pre_alloc_obj<size>(num_comps); //for *recon_comp_size
       for (ui32 i = 0; i < num_comps; ++i)
-        allocator->pre_alloc_data<si32>(siz.get_recon_width(i), 0);
+        frame_allocator->pre_alloc_data<si32>(siz.get_recon_width(i), 0);
 
       //allocate tlm
       if (outfile != NULL && need_tlm)
-        allocator->pre_alloc_obj<param_tlm::Ttlm_Ptlm_pair>(num_tileparts);
+        frame_allocator->pre_alloc_obj<param_tlm::Ttlm_Ptlm_pair>(
+          num_tileparts);
 
       //precinct scratch buffer
       // The precinct scratch is shared by all components, but each component
@@ -217,26 +240,24 @@ namespace ojph {
       precinct_scratch_needed_bytes =
         16 * ((max_ratio * max_ratio * 4 + 2) / 3);
 
-      allocator->pre_alloc_obj<ui8>(precinct_scratch_needed_bytes);
+      frame_allocator->pre_alloc_obj<ui8>(precinct_scratch_needed_bytes);
     }
 
     //////////////////////////////////////////////////////////////////////////
-    void codestream::finalize_alloc()
+    void codestream::finalize_alloc(ui32 tr_beg, ui32 tr_end)
     {
       allocator->alloc();
 
-      //precinct scratch buffer
-      precinct_scratch =
-        allocator->post_alloc_obj<ui8>(precinct_scratch_needed_bytes);
-
-      //get tiles
-      tiles = this->allocator->post_alloc_obj<tile>((size_t)num_tiles.area());
+      // The frame-level structures have to exist before any tile is
+      // finalized: tile::finalize_alloc() reaches for the tiles array and
+      // for the precinct scratch buffer.
+      finalize_alloc_frame();
 
       ui32 num_tileparts = 0;
       point index;
       rect tile_rect;
       ojph::param_siz sz = access_siz();
-      for (index.y = 0; index.y < num_tiles.h; ++index.y)
+      for (index.y = tr_beg; index.y < tr_end; ++index.y)
       {
         ui32 y0 = sz.get_tile_offset().y
                 + index.y * sz.get_tile_size().h;
@@ -264,13 +285,31 @@ namespace ojph {
         }
       }
 
+      finalize_alloc_tlm(num_tileparts);
+    }
+
+    //////////////////////////////////////////////////////////////////////////
+    void codestream::finalize_alloc_frame()
+    {
+      frame_allocator->alloc();
+
+      //precinct scratch buffer
+      precinct_scratch =
+        frame_allocator->post_alloc_obj<ui8>(precinct_scratch_needed_bytes);
+
+      //get tiles
+      tiles =
+        frame_allocator->post_alloc_obj<tile>((size_t)num_tiles.area());
+
       //allocate lines
       //These lines are used by codestream to exchange data with external
       // world
+      ojph::param_siz sz = access_siz();
       this->num_comps = sz.get_num_components();
-      lines = allocator->post_alloc_obj<line_buf>(this->num_comps);
-      comp_size = allocator->post_alloc_obj<size>(this->num_comps);
-      recon_comp_size = allocator->post_alloc_obj<size>(this->num_comps);
+      lines = frame_allocator->post_alloc_obj<line_buf>(this->num_comps);
+      comp_size = frame_allocator->post_alloc_obj<size>(this->num_comps);
+      recon_comp_size =
+        frame_allocator->post_alloc_obj<size>(this->num_comps);
       employ_color_transform = cod.is_employing_color_transform();
       for (ui32 i = 0; i < this->num_comps; ++i)
       {
@@ -279,16 +318,24 @@ namespace ojph {
         ui32 cw = siz.get_recon_width(i);
         recon_comp_size[i].w = cw;
         recon_comp_size[i].h = siz.get_recon_height(i);
-        lines[i].wrap(allocator->post_alloc_data<si32>(cw, 0), cw, 0);
+        lines[i].wrap(frame_allocator->post_alloc_data<si32>(cw, 0), cw, 0);
       }
 
       cur_comp = 0;
       cur_line = 0;
+    }
 
-      //allocate tlm
+    //////////////////////////////////////////////////////////////////////////
+    void codestream::finalize_alloc_tlm(ui32 num_tileparts)
+    {
+      // The tile-part length markers can only be sized once every tile has
+      // been finalized, so unlike the rest of the frame-level structures
+      // they trail the tile loop; they still come from frame_allocator.
+      // This is an encoder-only structure.
       if (outfile != NULL && need_tlm)
         tlm.init(num_tileparts,
-          allocator->post_alloc_obj<param_tlm::Ttlm_Ptlm_pair>(num_tileparts));
+          frame_allocator->post_alloc_obj<param_tlm::Ttlm_Ptlm_pair>(
+            num_tileparts));
     }
 
 
@@ -640,8 +687,9 @@ namespace ojph {
 
       assert(this->outfile == NULL);
       this->outfile = file;
-      this->pre_alloc();
-      this->finalize_alloc();
+      calculate_num_tiles();
+      this->pre_alloc(0, num_tiles.h);
+      this->finalize_alloc(0, num_tiles.h);
 
       ui16 t = swap_bytes_if_le((ui16)JP2K_MARKER::SOC);
       if (file->write(&t, 2) != 2)
@@ -932,8 +980,9 @@ namespace ojph {
     //////////////////////////////////////////////////////////////////////////
     void codestream::read()
     {
-      this->pre_alloc();
-      this->finalize_alloc();
+      calculate_num_tiles();
+      this->pre_alloc(0, num_tiles.h);
+      this->finalize_alloc(0, num_tiles.h);
 
       while (true)
       {
