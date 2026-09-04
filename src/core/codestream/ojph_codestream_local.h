@@ -61,6 +61,21 @@ namespace ojph {
     class tile;
 
     //////////////////////////////////////////////////////////////////////////
+    // One tile-part, as located by the index pass of a lazily parsed
+    // codestream.  It holds everything tile::parse_tile_header() needs in
+    // order to be replayed later: the two file offsets it works between,
+    // and the SOT fields, which param_sot::init() reconstructs exactly.
+    struct tile_part_locator
+    {
+      ui64 tile_start;    // just past the SOT marker segment
+      ui64 sod_end;       // just past the SOD marker, where the packets start
+      ui32 payload_len;   // param_sot::get_payload_length()
+      ui16 tile_idx;      // Isot
+      ui8 tpsot;          // TPsot
+      ui8 tnsot;          // TNsot
+    };
+
+    //////////////////////////////////////////////////////////////////////////
     class codestream
     {
       friend ::ojph::codestream;
@@ -102,6 +117,7 @@ namespace ojph {
                          ui32 num_comments);
       void enable_resilience();
       bool is_resilient() { return resilient; }
+      void enable_tile_row_streaming();
       void read_headers(infile_base *file);
       void restrict_input_resolution(ui32 skipped_res_for_data,
         ui32 skipped_res_for_recon);
@@ -140,6 +156,17 @@ namespace ojph {
       void pre_alloc_frame(ui32 num_tileparts);
       void finalize_alloc_frame();
       void finalize_alloc_tlm(ui32 num_tileparts);
+      // The tile-level halves; these are the only ones a per-tile-row cycle
+      // repeats, and they draw on "allocator" alone.
+      void pre_alloc_tiles(ui32 tr_beg, ui32 tr_end, ui32& num_tileparts);
+      void finalize_alloc_tiles(ui32 tr_beg, ui32 tr_end,
+                                ui32& num_tileparts);
+      // Appends one entry to the tile-part index and skips the tile-part
+      // payload; this is read()'s index pass in lazy mode.
+      void record_tile_part(const param_sot& sot, ui64 tile_start);
+      // Recycles the tile-level arenas onto tile row "tile_row" and replays
+      // that row's tile-parts.  A no-op if the row is already the one held.
+      void load_tile_row(ui32 tile_row);
 
     private:
       ui32 precinct_scratch_needed_bytes;
@@ -151,6 +178,18 @@ namespace ojph {
       ui32 cur_tile_row;
       bool resilient;
       ui32 skipped_res_for_read, skipped_res_for_recon;
+
+    private:
+      // Lazy, one-tile-row-at-a-time parsing; see
+      // ojph::codestream::enable_tile_row_streaming().  The index pass of
+      // read() fills tile_part_index[] and parses nothing; load_tile_row()
+      // then replays one tile row's entries at a time.
+      static const ui32 no_tile_row = (ui32)-1;
+      bool tile_row_streaming;
+      ui32 loaded_tile_row;           // the row held, or no_tile_row
+      tile_part_locator* tile_part_index;
+      ui32 num_tile_part_entries;     // entries in use
+      ui32 tile_part_index_size;      // entries allocated
 
     private:
       size num_tiles;

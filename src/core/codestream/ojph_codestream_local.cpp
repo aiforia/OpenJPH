@@ -38,6 +38,7 @@
 
 #include <climits>
 #include <cmath>
+#include <cstdlib>
 
 #include "ojph_mem.h"
 #include "ojph_params.h"
@@ -54,8 +55,8 @@ namespace ojph {
 
     //////////////////////////////////////////////////////////////////////////
     codestream::codestream()
-    : precinct_scratch(NULL), allocator(NULL), frame_allocator(NULL),
-      elastic_alloc(NULL)
+    : precinct_scratch(NULL), tile_part_index(NULL), allocator(NULL),
+      frame_allocator(NULL), elastic_alloc(NULL)
     {
       allocator = new mem_fixed_allocator;
       frame_allocator = new mem_fixed_allocator;
@@ -70,6 +71,8 @@ namespace ojph {
     //////////////////////////////////////////////////////////////////////////
     codestream::~codestream()
     {
+      if (tile_part_index)
+        free(tile_part_index);
       if (allocator)
         delete allocator;
       if (frame_allocator)
@@ -100,6 +103,14 @@ namespace ojph {
       cur_tile_row = 0;
       resilient = false;
       skipped_res_for_read = skipped_res_for_recon = 0;
+
+      tile_row_streaming = false;
+      loaded_tile_row = no_tile_row;
+      if (tile_part_index)
+        free(tile_part_index);
+      tile_part_index = NULL;
+      num_tile_part_entries = 0;
+      tile_part_index_size = 0;
 
       precinct_scratch_needed_bytes = 0;
 
@@ -133,8 +144,16 @@ namespace ojph {
     {
       calculate_num_tiles();
 
-      ojph::param_siz sz = access_siz();
       ui32 num_tileparts = 0;
+      pre_alloc_tiles(tr_beg, tr_end, num_tileparts);
+      pre_alloc_frame(num_tileparts);
+    }
+
+    //////////////////////////////////////////////////////////////////////////
+    void codestream::pre_alloc_tiles(ui32 tr_beg, ui32 tr_end,
+                                     ui32& num_tileparts)
+    {
+      ojph::param_siz sz = access_siz();
       point index;
       rect tile_rect, recon_tile_rect;
       ui32 ds = 1 << skipped_res_for_recon;
@@ -175,8 +194,6 @@ namespace ojph {
           num_tileparts += tps;
         }
       }
-
-      pre_alloc_frame(num_tileparts);
     }
 
     //////////////////////////////////////////////////////////////////////////
@@ -254,6 +271,14 @@ namespace ojph {
       finalize_alloc_frame();
 
       ui32 num_tileparts = 0;
+      finalize_alloc_tiles(tr_beg, tr_end, num_tileparts);
+      finalize_alloc_tlm(num_tileparts);
+    }
+
+    //////////////////////////////////////////////////////////////////////////
+    void codestream::finalize_alloc_tiles(ui32 tr_beg, ui32 tr_end,
+                                          ui32& num_tileparts)
+    {
       point index;
       rect tile_rect;
       ojph::param_siz sz = access_siz();
@@ -284,8 +309,6 @@ namespace ojph {
           num_tileparts += tps;
         }
       }
-
-      finalize_alloc_tlm(num_tileparts);
     }
 
     //////////////////////////////////////////////////////////////////////////
@@ -978,11 +1001,110 @@ namespace ojph {
     }
 
     //////////////////////////////////////////////////////////////////////////
+    void codestream::enable_tile_row_streaming()
+    {
+      if (outfile != NULL)
+        OJPH_ERROR(0x000300A4, "Tile row streaming is only available to a "
+          "decoding codestream.\n");
+      if (infile == NULL)
+        OJPH_ERROR(0x000300A5, "Tile row streaming must be enabled after "
+          "reading the file headers, and before create().\n");
+      // The tile-parts are parsed long after they have been walked over, so
+      // the file has to be able to go back to them.
+      si64 pos = infile->tell();
+      if (pos < 0 || infile->seek(pos, infile_base::OJPH_SEEK_SET) != 0)
+        OJPH_ERROR(0x000300A6, "Tile row streaming requires a seekable "
+          "file.\n");
+      this->tile_row_streaming = true;
+    }
+
+    //////////////////////////////////////////////////////////////////////////
+    void codestream::record_tile_part(const param_sot& sot, ui64 tile_start)
+    {
+      if (num_tile_part_entries == tile_part_index_size)
+      {
+        ui32 new_size = tile_part_index_size ? tile_part_index_size << 1 : 256;
+        void* p = realloc(tile_part_index,
+          (size_t)new_size * sizeof(tile_part_locator));
+        if (p == NULL)
+          OJPH_ERROR(0x00030068, "Failed to grow the tile-part index to %d "
+            "entries.\n", new_size);
+        tile_part_index = (tile_part_locator*)p;
+        tile_part_index_size = new_size;
+      }
+
+      tile_part_locator* e = tile_part_index + num_tile_part_entries++;
+      e->tile_start = tile_start;
+      e->sod_end = (ui64)infile->tell();
+      e->payload_len = sot.get_payload_length();
+      e->tile_idx = sot.get_tile_index();
+      e->tpsot = sot.get_tile_part_index();
+      e->tnsot = sot.get_num_tile_parts();
+
+      // Skip the payload, landing exactly where the eager path lands: every
+      // tile-part occupies [tile_start, tile_start + Psot - 12), and
+      // tile::parse_tile_header() also ends by seeking to that end.  A last
+      // tile-part with Psot == 0 has get_payload_length() == 0 there too, so
+      // both paths resume the marker walk right after the SOT segment.
+      infile->seek((si64)(tile_start + e->payload_len),
+        infile_base::OJPH_SEEK_SET);
+    }
+
+    //////////////////////////////////////////////////////////////////////////
+    void codestream::load_tile_row(ui32 tile_row)
+    {
+      if (tile_row == loaded_tile_row)
+        return;
+
+      // Recycle the tile-level arenas.  The frame-level structures, the
+      // tiles array included, sit on frame_allocator and stay put; only the
+      // tile objects of this row are re-created, which is why the row being
+      // held has to be the only row anyone reaches into.
+      allocator->restart();
+      elastic_alloc->restart();
+      ui32 num_tileparts = 0;
+      pre_alloc_tiles(tile_row, tile_row + 1, num_tileparts);
+      allocator->alloc();
+      finalize_alloc_tiles(tile_row, tile_row + 1, num_tileparts);
+      loaded_tile_row = tile_row;
+
+      // Replay this row's tile-parts in file order.  A tile's own parts
+      // ascend in TPsot in file order (T.800 A.4.2), which is what
+      // tile::parse_tile_header() insists on, but they need not be
+      // contiguous: other tiles' parts may sit between them, so the index
+      // has to be filtered rather than sliced.
+      for (ui32 i = 0; i < num_tile_part_entries; ++i)
+      {
+        const tile_part_locator* e = tile_part_index + i;
+        if ((ui32)e->tile_idx / num_tiles.w != tile_row)
+          continue;
+        if (infile->seek((si64)e->sod_end, infile_base::OJPH_SEEK_SET) != 0)
+          OJPH_ERROR(0x00030069, "Failed to seek to the data of tile %d, "
+            "tile part %d.\n", e->tile_idx, e->tpsot);
+        param_sot sot;
+        sot.init(e->payload_len, e->tile_idx, e->tpsot, e->tnsot);
+        tiles[e->tile_idx].parse_tile_header(sot, infile, e->tile_start);
+      }
+    }
+
+    //////////////////////////////////////////////////////////////////////////
     void codestream::read()
     {
       calculate_num_tiles();
-      this->pre_alloc(0, num_tiles.h);
-      this->finalize_alloc(0, num_tiles.h);
+      if (tile_row_streaming)
+      {
+        // Only the frame-level structures are taken up front; the tile rows
+        // are allocated and parsed one at a time, on demand, by pull().
+        pre_alloc_frame(0);
+        finalize_alloc_frame();
+        num_tile_part_entries = 0;
+        loaded_tile_row = no_tile_row;
+      }
+      else
+      {
+        this->pre_alloc(0, num_tiles.h);
+        this->finalize_alloc(0, num_tiles.h);
+      }
 
       while (true)
       {
@@ -1078,8 +1200,15 @@ namespace ojph {
                 }
               }
               if (sod_found)
-                tiles[sot.get_tile_index()].parse_tile_header(sot, infile,
-                  tile_start_location);
+              {
+                // In lazy mode this is only indexed; load_tile_row() parses
+                // it when its tile row is pulled.
+                if (tile_row_streaming)
+                  record_tile_part(sot, tile_start_location);
+                else
+                  tiles[sot.get_tile_index()].parse_tile_header(sot, infile,
+                    tile_start_location);
+              }
             }
             else
             { //first tile part
@@ -1162,8 +1291,15 @@ namespace ojph {
                 }
               }
               if (sod_found)
-                tiles[sot.get_tile_index()].parse_tile_header(sot, infile,
-                  tile_start_location);
+              {
+                // In lazy mode this is only indexed; load_tile_row() parses
+                // it when its tile row is pulled.
+                if (tile_row_streaming)
+                  record_tile_part(sot, tile_start_location);
+                else
+                  tiles[sot.get_tile_index()].parse_tile_header(sot, infile,
+                    tile_start_location);
+              }
             }
           }
         }
@@ -1296,6 +1432,11 @@ namespace ojph {
     //////////////////////////////////////////////////////////////////////////
     line_buf* codestream::pull(ui32 &comp_num)
     {
+      // In lazy mode the row about to be pulled has to be in memory.  This
+      // covers the first pull of all, and, in planar mode, the return to
+      // row 0 that the component switch below performs.
+      if (tile_row_streaming)
+        load_tile_row(cur_tile_row);
       bool success = false;
       while (!success)
       {
@@ -1306,9 +1447,25 @@ namespace ojph {
           if ((success &= tiles[idx].pull(lines + cur_comp, cur_comp)) == false)
             break;
         }
-        cur_tile_row += success == false ? 1 : 0;
-        if (cur_tile_row >= num_tiles.h)
-          cur_tile_row = 0;
+        if (success == false)
+        {
+          ++cur_tile_row;
+          if (cur_tile_row >= num_tiles.h)
+          {
+            // The image is done.  Do not load row 0 back in here: the wrap
+            // is shared with the planar reset below, and that one comes
+            // back through the load above on the next call.  Getting here
+            // instead means the caller kept pulling past the last line, in
+            // which case row 0 has already been recycled.
+            cur_tile_row = 0;
+            if (tile_row_streaming)
+              OJPH_ERROR(0x0003006A, "Pulling past the last line of the "
+                "image is not supported when tile row streaming is "
+                "enabled.\n");
+          }
+          else if (tile_row_streaming)
+            load_tile_row(cur_tile_row);
+        }
       }
       comp_num = cur_comp;
 

@@ -95,7 +95,7 @@ bool get_arguments(int argc, char *argv[],
                    char *&input_filename, char *&output_filename,
                    ojph::ui32& skipped_res_for_read,
                    ojph::ui32& skipped_res_for_recon,
-                   bool& resilient)
+                   bool& resilient, bool& stream_tile_rows)
 {
   ojph::cli_interpreter interpreter;
   interpreter.init(argc, argv);
@@ -108,6 +108,7 @@ bool get_arguments(int argc, char *argv[],
   interpreter.reinterpret("-o", output_filename);
   interpreter.reinterpret("-skip_res", &ilist);
   interpreter.reinterpret("-resilient", resilient);
+  interpreter.reinterpret("-stream_tile_rows", stream_tile_rows);
 
   //interpret skipped_string
   if (num_skipped_res > 0)
@@ -169,6 +170,7 @@ int main(int argc, char *argv[]) {
   ojph::ui32 skipped_res_for_read = 0;
   ojph::ui32 skipped_res_for_recon = 0;
   bool resilient = false;
+  bool stream_tile_rows = false;
 
   if (argc <= 1) {
     std::cout <<
@@ -190,13 +192,17 @@ int main(int argc, char *argv[]) {
     " -resilient <true | false> if 'true', the decoder will not exit when\n"
     "            running into recoverable errors in the codestream.\n"
     "            Default: 'false'.\n"
+    " -stream_tile_rows <true | false> if 'true', the codestream is parsed\n"
+    "            one tile row at a time, instead of all at once, which\n"
+    "            reduces peak memory roughly by the number of tile rows.\n"
+    "            Default: 'false'.\n"
     "\n"
     ;
     return -1;
   }
   if (!get_arguments(argc, argv, input_filename, output_filename,
                      skipped_res_for_read, skipped_res_for_recon,
-                     resilient))
+                     resilient, stream_tile_rows))
   {
     return -1;
   }
@@ -385,6 +391,9 @@ int main(int argc, char *argv[]) {
     else
       OJPH_ERROR(0x0200000B,
         "Please supply a proper output filename with a proper extension\n");
+
+    if (stream_tile_rows)
+      codestream.enable_tile_row_streaming();
 
     codestream.create();
 
