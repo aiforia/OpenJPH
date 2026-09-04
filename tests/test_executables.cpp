@@ -36,6 +36,8 @@
 //***************************************************************************/
 
 #include <array>
+#include <cstdio>
+#include <cstring>
 #include <string>
 #include "ojph_arch.h"
 #include "gtest/gtest.h"
@@ -174,6 +176,29 @@ void run_ojph_expand(const std::string& base_filename,
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+//                        run_ojph_expand_streamed
+////////////////////////////////////////////////////////////////////////////////
+// Same as run_ojph_expand, but the decoder is asked to parse and hold one
+// tile row at a time, and the decoded image is written to its own file, so
+// that the two decodings of one codestream can be compared.
+void run_ojph_expand_streamed(const std::string& base_filename,
+  const std::string& src_ext,
+  const std::string& out_ext)
+{
+  try {
+    std::string result, command;
+    command = std::string(EXPAND_EXECUTABLE)
+      + " -i " + SRC_FILE_DIR + base_filename + "." + src_ext
+      + " -o " + OUT_FILE_DIR + base_filename + "_streamed." + out_ext
+      + " -stream_tile_rows true";
+    EXPECT_EQ(execute(command, result), 0);
+  }
+  catch (const std::runtime_error& error) {
+    FAIL() << error.what();
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////
 //                            run_ojph_compress
 ////////////////////////////////////////////////////////////////////////////////
 void run_ojph_compress_expand(const std::string& base_filename,
@@ -185,6 +210,29 @@ void run_ojph_compress_expand(const std::string& base_filename,
     command = std::string(EXPAND_EXECUTABLE)
       + " -i " + OUT_FILE_DIR + base_filename + "." + out_ext
       + " -o " + OUT_FILE_DIR + base_filename + "." + decode_ext;
+    EXPECT_EQ(execute(command, result), 0);
+  }
+  catch (const std::runtime_error& error) {
+    FAIL() << error.what();
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//                    run_ojph_compress_expand_streamed
+////////////////////////////////////////////////////////////////////////////////
+// Same as run_ojph_compress_expand, but the decoder is asked to parse and
+// hold one tile row at a time, and the decoded image is written to its own
+// file, so that the two decodings of one codestream can be compared.
+void run_ojph_compress_expand_streamed(const std::string& base_filename,
+  const std::string& out_ext,
+  const std::string& decode_ext)
+{
+  try {
+    std::string result, command;
+    command = std::string(EXPAND_EXECUTABLE)
+      + " -i " + OUT_FILE_DIR + base_filename + "." + out_ext
+      + " -o " + OUT_FILE_DIR + base_filename + "_streamed." + decode_ext
+      + " -stream_tile_rows true";
     EXPECT_EQ(execute(command, result), 0);
   }
   catch (const std::runtime_error& error) {
@@ -254,6 +302,75 @@ void compare_files(const std::string& base_filename,
   catch (const std::runtime_error& error) {
     FAIL() << error.what();
   }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//                            compare_out_files
+////////////////////////////////////////////////////////////////////////////////
+// Compares two files the tests generated in OUT_FILE_DIR, byte for byte,
+// and reports where they first differ.  This does not use compare_files,
+// the executable the codestream comparisons go through, and must not be
+// changed to: compare_files reads a 0xFF64 pair as the start of a comment
+// segment and then skips the segment in both files without comparing it,
+// which is right for a codestream but wrong here, where the files are
+// decoded images in which 0xFF is an ordinary sample value.  What these
+// tests are for is catching a difference anywhere in such a file.
+void compare_out_files(const std::string& first_filename,
+  const std::string& second_filename,
+  const std::string& ext)
+{
+  const std::string name1 =
+    std::string(OUT_FILE_DIR) + first_filename + "." + ext;
+  const std::string name2 =
+    std::string(OUT_FILE_DIR) + second_filename + "." + ext;
+
+  FILE* f1 = fopen(name1.c_str(), "rb");
+  FILE* f2 = fopen(name2.c_str(), "rb");
+  if (f1 == NULL || f2 == NULL) {
+    if (f1 != NULL)
+      fclose(f1);
+    if (f2 != NULL)
+      fclose(f2);
+    FAIL() << "Unable to open " << (f1 == NULL ? name1 : name2);
+  }
+
+  fseek(f1, 0, SEEK_END);
+  fseek(f2, 0, SEEK_END);
+  ojph::si64 size1 = (ojph::si64)ftell(f1);
+  ojph::si64 size2 = (ojph::si64)ftell(f2);
+  rewind(f1);
+  rewind(f2);
+
+  // the first byte at which the two files differ, or -1 if the shorter of
+  // the two is a prefix of the other
+  ojph::si64 first_diff = -1;
+  ojph::ui32 byte1 = 0, byte2 = 0;
+  ojph::si64 offset = 0;
+  std::array<char, 16384> buf1, buf2;
+  while (first_diff < 0) {
+    size_t num1 = fread(buf1.data(), 1, buf1.size(), f1);
+    size_t num2 = fread(buf2.data(), 1, buf2.size(), f2);
+    size_t num = num1 < num2 ? num1 : num2;
+    if (num == 0)
+      break;
+    if (memcmp(buf1.data(), buf2.data(), num) != 0) {
+      size_t idx = 0;
+      while (buf1[idx] == buf2[idx])
+        ++idx;
+      first_diff = offset + (ojph::si64)idx;
+      byte1 = (ojph::ui32)(ojph::ui8)buf1[idx];
+      byte2 = (ojph::ui32)(ojph::ui8)buf2[idx];
+    }
+    offset += (ojph::si64)num;
+  }
+  fclose(f1);
+  fclose(f2);
+
+  EXPECT_EQ(size1, size2) << name1 << " is " << size1 << " bytes, while "
+    << name2 << " is " << size2 << " bytes.";
+  EXPECT_EQ(first_diff, -1) << name1 << " and " << name2
+    << " first differ at byte " << first_diff << ", where one has "
+    << byte1 << " and the other has " << byte2 << ".";
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -1725,6 +1842,329 @@ TEST(TestExecutables, SimpleEncRev53Raw32Signed) {
 
 TEST(TestExecutables, SimpleEncRev53Raw32Unsigned) {
   run_raw_round_trip_test("simple_enc_rev53_raw32_unsigned", 32, false);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// The tests below decode a tiled codestream twice, once the ordinary way
+// and once with -stream_tile_rows, which makes the decoder parse and hold
+// one tile row at a time instead of the whole tile grid, and require the
+// two decoded images to be identical byte for byte.  There is one test per
+// tiled codestream in this suite, whether the suite ships it or a test
+// encodes it.  A per tile row parse has to reproduce the geometry the
+// eager parse derives from the whole grid, and these files cover what that
+// rests on: the two subsampled files decode through the planar interface,
+// which visits every tile row once per component; the five progression
+// orders vary the order the tile-parts arrive in; the 33 and 33x33 files
+// put both the image origin and the tile grid origin away from zero with
+// tile sizes that divide neither, so the number of codeblocks in a tile
+// depends on where the tile sits on the grid; and the encoded files
+// decompose a 33x33 or 32x32 tile as many as six times, which takes the
+// lowest resolution of a tile down to a single sample.
+// Each test decodes the file itself rather than relying on the test that
+// measures that file having run, so that it can be run on its own.  The
+// eager decode does land on the output name that test writes too, so
+// these tests are not safe to run concurrently with it, as they would be
+// under ctest -j.
+// Command-line options used to obtain this file is:
+// -o simple_dec_irv97_64x64_tiles_yuv.jph -precise -quiet -rate 0.5
+// Sdims={288,352},{144,176},{144,176} Ssampling={1,1},{2,2},{2,2}
+// Nprecision={8} Nsigned={no} Stiles={33,257} -full
+TEST(TestExecutables, StreamedMatchesEagerIrv9764x64TilesYuv) {
+  run_ojph_expand("simple_dec_irv97_64x64_tiles_yuv", "jph", "yuv");
+  run_ojph_expand_streamed("simple_dec_irv97_64x64_tiles_yuv", "jph", "yuv");
+  compare_out_files("simple_dec_irv97_64x64_tiles_yuv",
+                    "simple_dec_irv97_64x64_tiles_yuv_streamed", "yuv");
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Command-line options used to obtain this file is:
+// -o simple_dec_rev53_64x64_tiles_yuv.jph -precise -quiet Creversible=yes
+// Sdims={288,352},{144,176},{144,176} Ssampling={1,1},{2,2},{2,2}
+// Nprecision={8} Nsigned={no} Stiles={33,257} -full
+TEST(TestExecutables, StreamedMatchesEagerRev5364x64TilesYuv) {
+  run_ojph_expand("simple_dec_rev53_64x64_tiles_yuv", "jph", "yuv");
+  run_ojph_expand_streamed("simple_dec_rev53_64x64_tiles_yuv", "jph", "yuv");
+  compare_out_files("simple_dec_rev53_64x64_tiles_yuv",
+                    "simple_dec_rev53_64x64_tiles_yuv_streamed", "yuv");
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Command-line options used to obtain this file is:
+// -o simple_dec_irv97_64x64_tiles_LRCP.jph -precise -quiet -rate 0.5
+// Clevels=5 Corder=LRCP Cprecincts={2,256} Sorigin={374,1717}
+// Stile_origin={374,1717} -full
+TEST(TestExecutables, StreamedMatchesEagerIrv9764x64TilesLRCP) {
+  run_ojph_expand("simple_dec_irv97_64x64_tiles_LRCP", "jph", "ppm");
+  run_ojph_expand_streamed("simple_dec_irv97_64x64_tiles_LRCP", "jph", "ppm");
+  compare_out_files("simple_dec_irv97_64x64_tiles_LRCP",
+                    "simple_dec_irv97_64x64_tiles_LRCP_streamed", "ppm");
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Command-line options used to obtain this file is:
+// -o simple_dec_irv97_64x64_tiles_RLCP.jph -precise -quiet -rate 0.5
+// Clevels=5 Corder=RLCP Cprecincts={2,256} Sorigin={374,1717}
+// Stile_origin={374,1717} -full
+TEST(TestExecutables, StreamedMatchesEagerIrv9764x64TilesRLCP) {
+  run_ojph_expand("simple_dec_irv97_64x64_tiles_RLCP", "jph", "ppm");
+  run_ojph_expand_streamed("simple_dec_irv97_64x64_tiles_RLCP", "jph", "ppm");
+  compare_out_files("simple_dec_irv97_64x64_tiles_RLCP",
+                    "simple_dec_irv97_64x64_tiles_RLCP_streamed", "ppm");
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Command-line options used to obtain this file is:
+// -o simple_dec_irv97_64x64_tiles_RPCL.jph -precise -quiet -rate 0.5
+// Clevels=5 Corder=RPCL Cprecincts={2,256} Sorigin={374,1717}
+// Stile_origin={374,1717} -full
+TEST(TestExecutables, StreamedMatchesEagerIrv9764x64TilesRPCL) {
+  run_ojph_expand("simple_dec_irv97_64x64_tiles_RPCL", "jph", "ppm");
+  run_ojph_expand_streamed("simple_dec_irv97_64x64_tiles_RPCL", "jph", "ppm");
+  compare_out_files("simple_dec_irv97_64x64_tiles_RPCL",
+                    "simple_dec_irv97_64x64_tiles_RPCL_streamed", "ppm");
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Command-line options used to obtain this file is:
+// -o simple_dec_irv97_64x64_tiles_PCRL.jph -precise -quiet -rate 0.5
+// Clevels=5 Corder=PCRL Cprecincts={2,256} Sorigin={374,1717}
+// Stile_origin={374,1717} -full
+TEST(TestExecutables, StreamedMatchesEagerIrv9764x64TilesPCRL) {
+  run_ojph_expand("simple_dec_irv97_64x64_tiles_PCRL", "jph", "ppm");
+  run_ojph_expand_streamed("simple_dec_irv97_64x64_tiles_PCRL", "jph", "ppm");
+  compare_out_files("simple_dec_irv97_64x64_tiles_PCRL",
+                    "simple_dec_irv97_64x64_tiles_PCRL_streamed", "ppm");
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Command-line options used to obtain this file is:
+// -o simple_dec_irv97_64x64_tiles_CPRL.jph -precise -quiet -rate 0.5
+// Clevels=5 Corder=CPRL Cprecincts={2,256} Sorigin={374,1717}
+// Stile_origin={374,1717} -full
+TEST(TestExecutables, StreamedMatchesEagerIrv9764x64TilesCPRL) {
+  run_ojph_expand("simple_dec_irv97_64x64_tiles_CPRL", "jph", "ppm");
+  run_ojph_expand_streamed("simple_dec_irv97_64x64_tiles_CPRL", "jph", "ppm");
+  compare_out_files("simple_dec_irv97_64x64_tiles_CPRL",
+                    "simple_dec_irv97_64x64_tiles_CPRL_streamed", "ppm");
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Command-line options used to obtain this file is:
+// -o simple_dec_irv97_64x64_tiles_LRCP33.jph -precise -quiet -rate 0.5
+// Clevels=5 Corder=LRCP Sorigin={5,33} Stile_origin={5,10} Stiles={33,257}
+// -full
+TEST(TestExecutables, StreamedMatchesEagerIrv9764x64TilesLRCP33) {
+  run_ojph_expand("simple_dec_irv97_64x64_tiles_LRCP33", "jph", "ppm");
+  run_ojph_expand_streamed("simple_dec_irv97_64x64_tiles_LRCP33", "jph",
+                           "ppm");
+  compare_out_files("simple_dec_irv97_64x64_tiles_LRCP33",
+                    "simple_dec_irv97_64x64_tiles_LRCP33_streamed", "ppm");
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Command-line options used to obtain this file is:
+// -o simple_dec_irv97_64x64_tiles_RLCP33.jph -precise -quiet -rate 0.5
+// Clevels=5 Corder=RLCP Sorigin={5,33} Stile_origin={5,10} Stiles={33,257}
+// -full
+TEST(TestExecutables, StreamedMatchesEagerIrv9764x64TilesRLCP33) {
+  run_ojph_expand("simple_dec_irv97_64x64_tiles_RLCP33", "jph", "ppm");
+  run_ojph_expand_streamed("simple_dec_irv97_64x64_tiles_RLCP33", "jph",
+                           "ppm");
+  compare_out_files("simple_dec_irv97_64x64_tiles_RLCP33",
+                    "simple_dec_irv97_64x64_tiles_RLCP33_streamed", "ppm");
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Command-line options used to obtain this file is:
+// -o simple_dec_irv97_64x64_tiles_RPCL33.jph -precise -quiet -rate 0.5
+// Clevels=5 Corder=RPCL Sorigin={5,33} Stile_origin={5,10} Stiles={33,257}
+// -full
+TEST(TestExecutables, StreamedMatchesEagerIrv9764x64TilesRPCL33) {
+  run_ojph_expand("simple_dec_irv97_64x64_tiles_RPCL33", "jph", "ppm");
+  run_ojph_expand_streamed("simple_dec_irv97_64x64_tiles_RPCL33", "jph",
+                           "ppm");
+  compare_out_files("simple_dec_irv97_64x64_tiles_RPCL33",
+                    "simple_dec_irv97_64x64_tiles_RPCL33_streamed", "ppm");
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Command-line options used to obtain this file is:
+// -o simple_dec_irv97_64x64_tiles_PCRL33.jph -precise -quiet -rate 0.5
+// Clevels=5 Corder=PCRL Sorigin={5,33} Stile_origin={5,10} Stiles={33,257}
+// -full
+TEST(TestExecutables, StreamedMatchesEagerIrv9764x64TilesPCRL33) {
+  run_ojph_expand("simple_dec_irv97_64x64_tiles_PCRL33", "jph", "ppm");
+  run_ojph_expand_streamed("simple_dec_irv97_64x64_tiles_PCRL33", "jph",
+                           "ppm");
+  compare_out_files("simple_dec_irv97_64x64_tiles_PCRL33",
+                    "simple_dec_irv97_64x64_tiles_PCRL33_streamed", "ppm");
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Command-line options used to obtain this file is:
+// -o simple_dec_irv97_64x64_tiles_CPRL33.jph -precise -quiet -rate 0.5
+// Clevels=5 Corder=CPRL Sorigin={5,33} Stile_origin={5,10} Stiles={33,257}
+// -full
+TEST(TestExecutables, StreamedMatchesEagerIrv9764x64TilesCPRL33) {
+  run_ojph_expand("simple_dec_irv97_64x64_tiles_CPRL33", "jph", "ppm");
+  run_ojph_expand_streamed("simple_dec_irv97_64x64_tiles_CPRL33", "jph",
+                           "ppm");
+  compare_out_files("simple_dec_irv97_64x64_tiles_CPRL33",
+                    "simple_dec_irv97_64x64_tiles_CPRL33_streamed", "ppm");
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Command-line options used to obtain this file is:
+// -o simple_dec_irv97_64x64_tiles_LRCP33x33.jph -precise -quiet -rate 0.5
+// Clevels=5 Corder=LRCP Sorigin={5,33} Stile_origin={5,10} Stiles={33,33}
+// -full
+TEST(TestExecutables, StreamedMatchesEagerIrv9764x64TilesLRCP33x33) {
+  run_ojph_expand("simple_dec_irv97_64x64_tiles_LRCP33x33", "jph", "ppm");
+  run_ojph_expand_streamed("simple_dec_irv97_64x64_tiles_LRCP33x33", "jph",
+                           "ppm");
+  compare_out_files("simple_dec_irv97_64x64_tiles_LRCP33x33",
+                    "simple_dec_irv97_64x64_tiles_LRCP33x33_streamed", "ppm");
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Command-line options used to obtain this file is:
+// -o simple_dec_irv97_64x64_tiles_RLCP33x33.jph -precise -quiet -rate 0.5
+// Clevels=5 Corder=RLCP Sorigin={5,33} Stile_origin={5,10} Stiles={33,33}
+// -full
+TEST(TestExecutables, StreamedMatchesEagerIrv9764x64TilesRLCP33x33) {
+  run_ojph_expand("simple_dec_irv97_64x64_tiles_RLCP33x33", "jph", "ppm");
+  run_ojph_expand_streamed("simple_dec_irv97_64x64_tiles_RLCP33x33", "jph",
+                           "ppm");
+  compare_out_files("simple_dec_irv97_64x64_tiles_RLCP33x33",
+                    "simple_dec_irv97_64x64_tiles_RLCP33x33_streamed", "ppm");
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Command-line options used to obtain this file is:
+// -o simple_dec_irv97_64x64_tiles_RPCL33x33.jph -precise -quiet -rate 0.5
+// Clevels=5 Corder=RPCL Sorigin={5,33} Stile_origin={5,10} Stiles={33,33}
+// -full
+TEST(TestExecutables, StreamedMatchesEagerIrv9764x64TilesRPCL33x33) {
+  run_ojph_expand("simple_dec_irv97_64x64_tiles_RPCL33x33", "jph", "ppm");
+  run_ojph_expand_streamed("simple_dec_irv97_64x64_tiles_RPCL33x33", "jph",
+                           "ppm");
+  compare_out_files("simple_dec_irv97_64x64_tiles_RPCL33x33",
+                    "simple_dec_irv97_64x64_tiles_RPCL33x33_streamed", "ppm");
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Command-line options used to obtain this file is:
+// -o simple_dec_irv97_64x64_tiles_PCRL33x33.jph -precise -quiet -rate 0.5
+// Clevels=5 Corder=PCRL Sorigin={5,33} Stile_origin={5,10} Stiles={33,33}
+// -full
+TEST(TestExecutables, StreamedMatchesEagerIrv9764x64TilesPCRL33x33) {
+  run_ojph_expand("simple_dec_irv97_64x64_tiles_PCRL33x33", "jph", "ppm");
+  run_ojph_expand_streamed("simple_dec_irv97_64x64_tiles_PCRL33x33", "jph",
+                           "ppm");
+  compare_out_files("simple_dec_irv97_64x64_tiles_PCRL33x33",
+                    "simple_dec_irv97_64x64_tiles_PCRL33x33_streamed", "ppm");
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Command-line options used to obtain this file is:
+// -o simple_dec_irv97_64x64_tiles_CPRL33x33.jph -precise -quiet -rate 0.5
+// Clevels=5 Corder=CPRL Sorigin={5,33} Stile_origin={5,10} Stiles={33,33}
+// -full
+TEST(TestExecutables, StreamedMatchesEagerIrv9764x64TilesCPRL33x33) {
+  run_ojph_expand("simple_dec_irv97_64x64_tiles_CPRL33x33", "jph", "ppm");
+  run_ojph_expand_streamed("simple_dec_irv97_64x64_tiles_CPRL33x33", "jph",
+                           "ppm");
+  compare_out_files("simple_dec_irv97_64x64_tiles_CPRL33x33",
+                    "simple_dec_irv97_64x64_tiles_CPRL33x33_streamed", "ppm");
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Command-line options used to obtain this file is:
+// -o simple_dec_rev53_64x64_gray_tiles.jph -precise -quiet Creversible=yes
+// Clevels=5 Stiles={33,257} -full
+TEST(TestExecutables, StreamedMatchesEagerRev5364x64GrayTiles) {
+  run_ojph_expand("simple_dec_rev53_64x64_gray_tiles", "jph", "pgm");
+  run_ojph_expand_streamed("simple_dec_rev53_64x64_gray_tiles", "jph", "pgm");
+  compare_out_files("simple_dec_rev53_64x64_gray_tiles",
+                    "simple_dec_rev53_64x64_gray_tiles_streamed", "pgm");
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Command-line options used to obtain this file is:
+// -o simple_dec_irv97_64x64_gray_tiles.jph -precise -quiet -rate 0.5
+// Clevels=5 Stiles={33,257} -full
+TEST(TestExecutables, StreamedMatchesEagerIrv9764x64GrayTiles) {
+  run_ojph_expand("simple_dec_irv97_64x64_gray_tiles", "jph", "pgm");
+  run_ojph_expand_streamed("simple_dec_irv97_64x64_gray_tiles", "jph", "pgm");
+  compare_out_files("simple_dec_irv97_64x64_gray_tiles",
+                    "simple_dec_irv97_64x64_gray_tiles_streamed", "pgm");
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// The four tests below encode their own codestream first, so what is
+// decoded twice is a codestream this library wrote, with the tile-parts
+// laid out the way it lays them out.
+// The compressed file is obtained using these command-line options:
+// -o simple_enc_irv97_64x64_tiles_33x33_d5.j2c -qstep 0.01 -tile_size {33,33}
+// -num_decomps 5
+TEST(TestExecutables, StreamedMatchesEagerEncIrv9764x64Tiles33x33D5) {
+  run_ojph_compress("Malamute.ppm",
+                    "simple_enc_irv97_64x64_tiles_33x33_d5", "", "j2c",
+                    "-qstep 0.01 -tile_size \"{33,33}\" -num_decomps 5");
+  run_ojph_compress_expand("simple_enc_irv97_64x64_tiles_33x33_d5", "j2c",
+                           "ppm");
+  run_ojph_compress_expand_streamed("simple_enc_irv97_64x64_tiles_33x33_d5",
+                                    "j2c", "ppm");
+  compare_out_files("simple_enc_irv97_64x64_tiles_33x33_d5",
+                    "simple_enc_irv97_64x64_tiles_33x33_d5_streamed", "ppm");
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// The compressed file is obtained using these command-line options:
+// -o simple_enc_irv97_64x64_tiles_33x33_d6.j2c -qstep 0.01 -tile_size {33,33}
+// -num_decomps 6
+TEST(TestExecutables, StreamedMatchesEagerEncIrv9764x64Tiles33x33D6) {
+  run_ojph_compress("Malamute.ppm",
+                    "simple_enc_irv97_64x64_tiles_33x33_d6", "", "j2c",
+                    "-qstep 0.01 -tile_size \"{33,33}\" -num_decomps 6");
+  run_ojph_compress_expand("simple_enc_irv97_64x64_tiles_33x33_d6", "j2c",
+                           "ppm");
+  run_ojph_compress_expand_streamed("simple_enc_irv97_64x64_tiles_33x33_d6",
+                                    "j2c", "ppm");
+  compare_out_files("simple_enc_irv97_64x64_tiles_33x33_d6",
+                    "simple_enc_irv97_64x64_tiles_33x33_d6_streamed", "ppm");
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// The compressed file is obtained using these command-line options:
+// -o simple_enc_rev53_64x64_tiles_33x33_d5.j2c -reversible true -tile_size
+// {32,32} -num_decomps 5
+TEST(TestExecutables, StreamedMatchesEagerEncRev5364x64Tiles33x33D5) {
+  run_ojph_compress("Malamute.ppm",
+                    "simple_enc_rev53_64x64_tiles_33x33_d5", "", "j2c",
+                    "-reversible true -tile_size \"{32,32}\" -num_decomps 5");
+  run_ojph_compress_expand("simple_enc_rev53_64x64_tiles_33x33_d5", "j2c",
+                           "ppm");
+  run_ojph_compress_expand_streamed("simple_enc_rev53_64x64_tiles_33x33_d5",
+                                    "j2c", "ppm");
+  compare_out_files("simple_enc_rev53_64x64_tiles_33x33_d5",
+                    "simple_enc_rev53_64x64_tiles_33x33_d5_streamed", "ppm");
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// The compressed file is obtained using these command-line options:
+// -o simple_enc_rev53_64x64_tiles_33x33_d6.j2c -reversible true -tile_size
+// {32,32} -num_decomps 6
+TEST(TestExecutables, StreamedMatchesEagerEncRev5364x64Tiles33x33D6) {
+  run_ojph_compress("Malamute.ppm",
+                    "simple_enc_rev53_64x64_tiles_33x33_d6", "", "j2c",
+                    "-reversible true -tile_size \"{32,32}\" -num_decomps 6");
+  run_ojph_compress_expand("simple_enc_rev53_64x64_tiles_33x33_d6", "j2c",
+                           "ppm");
+  run_ojph_compress_expand_streamed("simple_enc_rev53_64x64_tiles_33x33_d6",
+                                    "j2c", "ppm");
+  compare_out_files("simple_enc_rev53_64x64_tiles_33x33_d6",
+                    "simple_enc_rev53_64x64_tiles_33x33_d6_streamed", "ppm");
 }
 
 ////////////////////////////////////////////////////////////////////////////////
