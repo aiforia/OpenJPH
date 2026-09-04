@@ -306,6 +306,23 @@ namespace ojph {
                                    ui32 skipped_res_for_recon); //before create
 
     /**
+     * @brief Enables lazy, tile-row-at-a-time parsing for a decoding
+     *        codestream: only the tile row currently being pulled is parsed
+     *        and held, instead of the whole frame being parsed and
+     *        preallocated by codestream::create().  Peak memory then falls
+     *        roughly by the number of tile rows.  Requires a seekable
+     *        infile, because create() only indexes the tile-parts and
+     *        codestream::pull() goes back for them.  Call this function
+     *        after codestream::read_headers() and before
+     *        codestream::create().
+     *
+     *        Encoding codestreams are not supported.  The planar interface
+     *        is, but it walks every tile row once per component, so each
+     *        row is parsed as many times as there are components.
+     */
+    void enable_tile_row_streaming();     // before create
+
+    /**
      * @brief This call is for a decoding (or reading) codestream.  Call this
      *        function after calling restrict_input_resolution(), if
      *        restrictions are needed.
