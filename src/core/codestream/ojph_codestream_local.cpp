@@ -183,40 +183,38 @@ namespace ojph {
         allocator->pre_alloc_obj<param_tlm::Ttlm_Ptlm_pair>(num_tileparts);
 
       //precinct scratch buffer
-      // The precinct scratch is shared by all components, but each component
-      // may override the codeblock/precinct geometry via a COC marker.  The
-      // per-component tag-tree storage (resolution.cpp) is derived from that
-      // component's effective params, so size the shared buffer from the
-      // largest ratio across every component (the main COD and all COC
-      // overrides).  Sizing from the COD alone under-reserves the buffer for
-      // any component whose COC declares a smaller codeblock than the COD.
-      size ratio;
+      // Shared by all components, so sized from the largest codeblock count
+      // any of them reaches; a COC may declare a smaller codeblock than the
+      // COD, and sizing from the COD alone would under-reserve. Bounded by
+      // the component extent, as resolution::pre_alloc is.
+      size max_cbs(1, 1);
       for (ui32 c = 0; c < num_comps; ++c)
       {
         const param_cod* cdp = cod.get_coc(c);
         ui32 num_decomps = cdp->get_num_decompositions();
         size log_cb = cdp->get_log_block_dims();
+        ui32 shift_w = ojph_min(log_cb.w, (ui32)31);
+        ui32 shift_h = ojph_min(log_cb.h, (ui32)31);
         for (ui32 r = 0; r <= num_decomps; ++r)
         {
           size log_PP = cdp->get_log_precinct_size(r);
-          ratio.w = ojph_max(ratio.w, log_PP.w - ojph_min(log_cb.w, log_PP.w));
-          ratio.h = ojph_max(ratio.h, log_PP.h - ojph_min(log_cb.h, log_PP.h));
+          ui32 by_ratio_w = 1u << (log_PP.w - ojph_min(log_cb.w, log_PP.w));
+          ui32 by_ratio_h = 1u << (log_PP.h - ojph_min(log_cb.h, log_PP.h));
+          ui32 ds = num_decomps - r;
+          ui32 res_w = siz.get_recon_width(c) >> ojph_min(ds, (ui32)31);
+          ui32 res_h = siz.get_recon_height(c) >> ojph_min(ds, (ui32)31);
+          max_cbs.w = ojph_max(max_cbs.w,
+            ojph_min(by_ratio_w, (res_w >> shift_w) + 2));
+          max_cbs.h = ojph_max(max_cbs.h,
+            ojph_min(by_ratio_h, (res_h >> shift_h) + 2));
         }
       }
-      ui32 max_ratio = ojph_max(ratio.w, ratio.h);
-      max_ratio = 1 << max_ratio;
-      // assuming that we have a hierarchy of n levels.
-      // This needs 4/3 times the area, rounded up
-      // (rounding up leaves one extra entry).
-      // This exta entry is necessary
-      // We need 4 such tables. These tables store
-      // 1. missing msbs and 2. their flags,
-      // 3. number of layers and 4. their flags
-      // A precinct is parsed with one set of these per subband, so the
-      // buffer holds precinct::num_parse_tag_trees of them.
+      // Missing msbs, the layer of first inclusion, and a flag tree for
+      // each: one set per subband, for num_parse_tag_trees in all.
       precinct_scratch_needed_bytes =
-        precinct::num_parse_tag_trees
-        * ((max_ratio * max_ratio * 4 + 2) / 3);
+        (size_t)precinct::num_parse_tag_trees
+        * (size_t)precinct::num_tag_tree_bytes(
+                    precinct::num_tag_tree_levels(max_cbs));
 
       allocator->pre_alloc_obj<ui8>(precinct_scratch_needed_bytes);
     }

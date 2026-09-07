@@ -211,6 +211,14 @@ namespace ojph {
             --lp.h;
           size max_cbs(1u << (lp.w - ojph_min(log_cb.w, lp.w)),
                        1u << (lp.h - ojph_min(log_cb.h, lp.h)));
+          // A precinct holds no more codeblocks than its resolution
+          // spans. The + 2 covers grid alignment at both ends.
+          ui32 shift_w = ojph_min(log_cb.w, (ui32)31);
+          ui32 shift_h = ojph_min(log_cb.h, (ui32)31);
+          size res_cbs(((trx1 - trx0) >> shift_w) + 2,
+                       ((try1 - try0) >> shift_h) + 2);
+          max_cbs.w = ojph_min(max_cbs.w, res_cbs.w);
+          max_cbs.h = ojph_min(max_cbs.h, res_cbs.h);
           size_t bytes = (size_t)precinct::num_parse_tag_trees
             * (size_t)precinct::num_tag_tree_bytes(
                          precinct::num_tag_tree_levels(max_cbs));
